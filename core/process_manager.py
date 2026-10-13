@@ -107,29 +107,52 @@ class ProcessManager:
             if self._processes[name].poll() is None
         }
 
+    def _resolve_server_dir(self, srcds_path: str) -> Path:
+        """Resolve the server directory from a srcds_path config value.
+
+        Accepts either a path to the srcds executable (uses its parent)
+        or a path to the server directory itself (used as-is).
+
+        Args:
+            srcds_path: Configured srcds path, may be a file or directory.
+
+        Returns:
+            The resolved server directory Path.
+        """
+        path = Path(srcds_path)
+        return path if path.is_dir() else path.parent
+
     def _find_start_script(self, srcds_path: str) -> Optional[Path]:
         """Find a startup script in the server directory.
 
-        Checks for ``start.sh`` on Linux/macOS and ``start.bat`` on Windows.
-        The script must reside in the same directory as the srcds executable.
+        On Linux/macOS checks for ``start.sh``. On Windows checks for
+        ``start.bat`` first, then falls back to ``start.sh`` (for Git Bash
+        / WSL setups). The ``srcds_path`` may point to either the srcds
+        executable or the server directory.
 
         Args:
-            srcds_path: Path to the srcds executable.
+            srcds_path: Path to the srcds executable or server directory.
 
         Returns:
             Path to the start script if found, None otherwise.
         """
-        server_dir = Path(srcds_path).parent
-        script_name = "start.bat" if is_windows() else "start.sh"
-        script_path = server_dir / script_name
+        server_dir = self._resolve_server_dir(srcds_path)
+        if is_windows():
+            for script_name in ("start.bat", "start.sh"):
+                script_path = server_dir / script_name
+                if script_path.is_file():
+                    return script_path
+            return None
+        script_path = server_dir / "start.sh"
         return script_path if script_path.is_file() else None
 
     def _build_start_command(self, config: ServerConfig) -> tuple[list[str], Path]:
         """Build the command-line arguments and working directory for starting the server.
 
-        If a ``start.sh`` (Linux) or ``start.bat`` (Windows) script exists in
-        the server directory, it is used preferentially. Otherwise the command
-        is built from the srcds executable and configured parameters.
+        If a ``start.sh`` (Linux) or ``start.bat`` / ``start.sh`` (Windows)
+        script exists in the server directory, it is used preferentially.
+        Otherwise the command is built from the srcds executable and configured
+        parameters.
 
         Args:
             config: Server configuration.
@@ -138,7 +161,8 @@ class ProcessManager:
             A tuple of (command_args, working_directory).
 
         Raises:
-            ValueError: If srcds_path is not configured.
+            ValueError: If srcds_path is not configured, or if srcds_path
+                points to a directory without a start script.
         """
         if not config.srcds_path:
             raise ValueError(
@@ -148,7 +172,7 @@ class ProcessManager:
         # Prefer start.sh / start.bat if present in the server directory
         start_script = self._find_start_script(config.srcds_path)
         if start_script is not None:
-            if is_windows():
+            if is_windows() and start_script.suffix == ".bat":
                 cmd = ["cmd", "/c", str(start_script)]
             else:
                 cmd = ["/bin/bash", str(start_script)]
@@ -157,8 +181,15 @@ class ProcessManager:
                 cmd.extend(shlex.split(config.start_params))
             return cmd, start_script.parent
 
-        # Fall back to direct srcds invocation
+        # No start script found: fall back to direct srcds invocation
         srcds = Path(config.srcds_path)
+        if srcds.is_dir():
+            raise ValueError(
+                f"服务器 '{config.name}' 的 srcds_path 指向目录 '{srcds}'，"
+                f"但该目录下未找到 start.sh（Linux）或 start.bat（Windows）。\n"
+                f"请在该目录下放置启动脚本，或将 srcds_path 改为 srcds 可执行文件的完整路径。"
+            )
+
         base_args = [
             str(srcds),
             "-game",
@@ -226,7 +257,16 @@ class ProcessManager:
             # Verify the primary executable exists (for srcds mode only;
             # /bin/bash and cmd are always present on their respective platforms)
             if not using_script and not os.path.isfile(cmd[0]):
-                return False, f"找不到 srcds 可执行文件: {cmd[0]}"
+                server_dir = self._resolve_server_dir(config.srcds_path)
+                script_name = "start.bat / start.sh" if is_windows() else "start.sh"
+                return False, (
+                    f"找不到 srcds 可执行文件: {cmd[0]}\n"
+                    f"已检查的服务器目录: {server_dir}\n"
+                    f"该目录下未找到 {script_name} 启动脚本。\n"
+                    f"请确认：\n"
+                    f"  1. srcds_path 指向正确的 srcds 可执行文件，或服务器目录\n"
+                    f"  2. 若使用启动脚本，确保脚本名为 {script_name} 且位于服务器目录下"
+                )
 
             try:
                 # On Windows, use CREATE_NEW_PROCESS_GROUP to allow clean termination

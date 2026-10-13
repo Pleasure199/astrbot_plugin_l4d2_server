@@ -42,8 +42,8 @@
           },
           "srcds_path": {
             "type": "string",
-            "description": "srcds 可执行文件路径",
-            "hint": "用于定位服务器目录；若该目录下存在 start.sh（Linux）或 start.bat（Windows），将优先使用脚本启动",
+            "description": "服务器目录或 srcds 路径",
+            "hint": "可填服务器目录（自动查找 start.sh）或 srcds 可执行文件完整路径",
             "default": ""
           },
           "start_params": {
