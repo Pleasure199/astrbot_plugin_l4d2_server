@@ -7,6 +7,7 @@ across Windows and Linux platforms.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import os
 import shlex
@@ -145,11 +146,15 @@ class ProcessManager:
 
         return base_args
 
-    async def start(self, server_name: str) -> tuple[bool, str]:
+    async def start(
+        self, server_name: str, extra_params: str = ""
+    ) -> tuple[bool, str]:
         """Start a server process.
 
         Args:
             server_name: Name of the server to start.
+            extra_params: Additional start parameters appended after the
+                configured start_params. Useful for saved presets.
 
         Returns:
             A tuple of (success, message).
@@ -162,6 +167,15 @@ class ProcessManager:
 
             if self.is_running(server_name):
                 return False, f"服务器 '{server_name}' 已经在运行中。"
+
+            # Merge extra params into a config copy
+            if extra_params:
+                merged = config.start_params
+                if merged:
+                    merged = f"{merged} {extra_params.strip()}"
+                else:
+                    merged = extra_params.strip()
+                config = dataclasses.replace(config, start_params=merged)
 
             try:
                 cmd = self._build_start_command(config)
@@ -296,6 +310,7 @@ class ProcessManager:
         self,
         server_name: str,
         rcon_client: Optional[RconClient] = None,
+        extra_params: str = "",
     ) -> tuple[bool, str]:
         """Restart a server process.
 
@@ -304,6 +319,7 @@ class ProcessManager:
         Args:
             server_name: Name of the server to restart.
             rcon_client: Optional RCON client for graceful shutdown.
+            extra_params: Additional start parameters for the new process.
 
         Returns:
             A tuple of (success, message).
@@ -323,7 +339,7 @@ class ProcessManager:
             await asyncio.sleep(2)
 
         # Start
-        return await self.start(server_name)
+        return await self.start(server_name, extra_params=extra_params)
 
     async def terminate_all(self) -> None:
         """Terminate all managed server processes.

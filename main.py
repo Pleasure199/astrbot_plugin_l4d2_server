@@ -7,6 +7,7 @@ Left 4 Dead 2 dedicated servers via RCON and process control.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 from astrbot.api.event import AstrMessageEvent, filter
@@ -27,6 +28,9 @@ logger = logging.getLogger("astrbot")
 
 # Valid L4D2 difficulty levels
 VALID_DIFFICULTIES = {"easy", "normal", "hard", "expert"}
+
+# KV store key for saved start presets
+KV_PRESETS_KEY = "saved_start_presets"
 
 
 class L4D2ServerManager(Star):
@@ -155,6 +159,62 @@ class L4D2ServerManager(Star):
         if not self.config.get("allow_public_query", True):
             return "查询功能已被管理员限制，仅管理员可使用。"
         return None
+
+    # --- Saved start presets ---
+
+    async def _load_presets(self) -> dict:
+        """Load all saved start presets from the KV store.
+
+        Returns:
+            Dict mapping preset names to preset data dicts.
+        """
+        return await self.get_kv_data(KV_PRESETS_KEY, {}) or {}
+
+    async def _save_presets(self, presets: dict) -> None:
+        """Persist the presets dict to the KV store.
+
+        Args:
+            presets: The complete presets dict to save.
+        """
+        await self.put_kv_data(KV_PRESETS_KEY, presets)
+
+    async def _get_preset(self, name: str) -> Optional[dict]:
+        """Get a single saved preset by name.
+
+        Args:
+            name: Preset name.
+
+        Returns:
+            Preset data dict, or None if not found.
+        """
+        presets = await self._load_presets()
+        return presets.get(name)
+
+    def _resolve_preset_server(
+        self, preset: dict, user_server: str
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Resolve which server a preset should operate on.
+
+        Priority: user-specified server > preset's server > default server.
+
+        Args:
+            preset: The preset data dict.
+            user_server: Server name explicitly provided by the user (may be empty).
+
+        Returns:
+            A tuple of (resolved_server_name, error_message).
+        """
+        self._refresh_process_manager()
+        names = self.process_manager.get_all_server_names()
+        if not names:
+            return None, "未配置任何 L4D2 服务器。"
+
+        candidate = user_server or preset.get("server", "")
+        if not candidate:
+            return names[0], None
+        if candidate not in names:
+            return None, f"服务器 '{candidate}' 不存在。可用: {', '.join(names)}"
+        return candidate, None
 
     async def initialize(self) -> None:
         """Plugin initialization hook. Logs loaded server count."""
@@ -311,6 +371,133 @@ class L4D2ServerManager(Star):
         rcon = self._get_rcon_client(name)
         yield event.plain_result(f"正在重启服务器 '{name}'...")
         success, msg = await self.process_manager.restart(name, rcon_client=rcon)
+        yield event.plain_result(msg)
+
+    # --- Saved start preset commands ---
+
+    @l4d2.command("save")
+    async def cmd_save(self, event: AstrMessageEvent, name: str, rest: GreedyStr):
+        """保存一个启动预设（仅管理员）。用法：/l4d2 save <名称> [服务器名] <启动参数...>"""
+        error = self._check_admin(event)
+        if error:
+            yield event.plain_result(error)
+            return
+
+        safe_name = sanitize_rcon_arg(name)
+        if not safe_name:
+            yield event.plain_result("预设名称不能为空。")
+            return
+
+        self._refresh_process_manager()
+        server_names = set(self.process_manager.get_all_server_names())
+
+        # Parse rest: first token may be a server name, remaining are params
+        tokens = rest.split()
+        preset_server = ""
+        preset_params = rest
+        if tokens and tokens[0] in server_names:
+            preset_server = tokens[0]
+            preset_params = " ".join(tokens[1:])
+
+        if not preset_params.strip():
+            yield event.plain_result(
+                "启动参数不能为空。\n用法：/l4d2 save <名称> [服务器名] <启动参数...>"
+            )
+            return
+
+        presets = await self._load_presets()
+        is_update = safe_name in presets
+        presets[safe_name] = {
+            "server": preset_server,
+            "params": preset_params,
+            "created_by": str(event.get_sender_id()),
+            "created_at": int(time.time()),
+        }
+        await self._save_presets(presets)
+
+        action = "更新" if is_update else "保存"
+        server_info = f"服务器: {preset_server}" if preset_server else "服务器: 默认"
+        yield event.plain_result(
+            f"已{action}启动预设 '{safe_name}'。\n"
+            f"{server_info}\n"
+            f"参数: {preset_params}\n"
+            f"使用 /l4d2 run {safe_name} 启动。"
+        )
+
+    @l4d2.command("saves")
+    async def cmd_saves(self, event: AstrMessageEvent):
+        """列出所有已保存的启动预设"""
+        presets = await self._load_presets()
+        if not presets:
+            yield event.plain_result(
+                "暂无保存的启动预设。\n"
+                "使用 /l4d2 save <名称> [服务器名] <启动参数...> 保存。"
+            )
+            return
+
+        lines = [f"=== 已保存的启动预设 ({len(presets)}个) ==="]
+        for idx, (pname, pdata) in enumerate(presets.items(), 1):
+            server = pdata.get("server", "") or "默认"
+            params = pdata.get("params", "")
+            created_at = pdata.get("created_at", 0)
+            time_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(created_at)) if created_at else "未知"
+            lines.append(
+                f"{idx}. {pname}\n"
+                f"   服务器: {server} | 保存于: {time_str}\n"
+                f"   参数: {params}"
+            )
+        lines.append("")
+        lines.append("使用 /l4d2 run <预设名> 启动，/l4d2 unsave <预设名> 删除。")
+        yield event.plain_result("\n".join(lines))
+
+    @l4d2.command("unsave")
+    async def cmd_unsave(self, event: AstrMessageEvent, name: str):
+        """删除一个已保存的启动预设（仅管理员）"""
+        error = self._check_admin(event)
+        if error:
+            yield event.plain_result(error)
+            return
+
+        safe_name = sanitize_rcon_arg(name)
+        presets = await self._load_presets()
+        if safe_name not in presets:
+            yield event.plain_result(f"预设 '{safe_name}' 不存在。")
+            return
+
+        del presets[safe_name]
+        await self._save_presets(presets)
+        yield event.plain_result(f"已删除启动预设 '{safe_name}'。")
+
+    @l4d2.command("run")
+    async def cmd_run(self, event: AstrMessageEvent, name: str, server_name: str = ""):
+        """使用保存的启动预设启动服务器（仅管理员）"""
+        error = self._check_admin(event)
+        if error:
+            yield event.plain_result(error)
+            return
+
+        safe_name = sanitize_rcon_arg(name)
+        preset = await self._get_preset(safe_name)
+        if preset is None:
+            yield event.plain_result(
+                f"预设 '{safe_name}' 不存在。\n"
+                f"使用 /l4d2 saves 查看所有预设。"
+            )
+            return
+
+        target_server, err = self._resolve_preset_server(preset, server_name)
+        if err:
+            yield event.plain_result(err)
+            return
+
+        extra_params = preset.get("params", "")
+        yield event.plain_result(
+            f"使用预设 '{safe_name}' 启动服务器 '{target_server}'...\n"
+            f"额外参数: {extra_params}"
+        )
+        success, msg = await self.process_manager.start(
+            target_server, extra_params=extra_params
+        )
         yield event.plain_result(msg)
 
     # --- Admin commands: server management via RCON ---
@@ -486,6 +673,12 @@ class L4D2ServerManager(Star):
                 "  /l4d2 kick <玩家名>      踢出玩家",
                 "  /l4d2 map <地图名>       切换地图",
                 "  /l4d2 diff <难度>        修改难度 (easy/normal/hard/expert)",
+                "",
+                "【启动预设】（仅管理员）",
+                "  /l4d2 save <名称> [服务器名] <参数...>  保存启动预设",
+                "  /l4d2 saves                               列出所有预设",
+                "  /l4d2 unsave <名称>                       删除预设",
+                "  /l4d2 run <名称> [服务器名]               使用预设启动",
             ])
         else:
             lines.extend([
