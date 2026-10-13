@@ -191,13 +191,29 @@ class SshClient:
         Returns:
             A tuple of (success, message).
         """
-        # Kill all srcds_run / srcds processes
-        remote_cmd = "pkill -f 'srcds_run|srcds.exe' 2>/dev/null; echo $?"
-        exit_code, out, _ = await self.execute(remote_cmd)
-        # pkill returns 0 if processes were signaled, 1 if none found
-        if out.strip() in ("0", "1"):
-            return True, "已发送停止信号到远程服务器进程"
-        return False, "停止命令执行失败"
+        # Match all possible L4D2 process names:
+        # srcds_linux (actual game binary), srcds_run (launcher script),
+        # srcds.exe (Windows). Send SIGTERM first, then SIGKILL if needed.
+        pattern = "srcds_linux|srcds_run|srcds.exe"
+        remote_cmd = (
+            f"pkill -f '{pattern}' 2>/dev/null; "
+            f"sleep 3; "
+            f"if pgrep -f '{pattern}' > /dev/null 2>&1; then "
+            f"pkill -9 -f '{pattern}' 2>/dev/null; sleep 1; fi; "
+            f"if pgrep -f '{pattern}' > /dev/null 2>&1; then echo 'still_running'; "
+            f"else echo 'stopped'; fi"
+        )
+        try:
+            _, out, err = await self.execute(remote_cmd)
+        except Exception as e:
+            return False, f"SSH 执行停止命令失败: {e}"
+
+        result = out.strip()
+        if result == "stopped":
+            return True, "远程服务器进程已停止"
+        if result == "still_running":
+            return False, "进程未能终止，可能需要手动 kill"
+        return False, f"停止命令异常: {err or out or '未知错误'}"
 
     async def is_running(self) -> bool:
         """Check if a srcds process is running on the remote machine.
@@ -205,7 +221,8 @@ class SshClient:
         Returns:
             True if at least one srcds process is found.
         """
-        remote_cmd = "pgrep -f 'srcds_run|srcds.exe' > /dev/null && echo 1 || echo 0"
+        pattern = "srcds_linux|srcds_run|srcds.exe"
+        remote_cmd = f"pgrep -f '{pattern}' > /dev/null && echo 1 || echo 0"
         try:
             _, out, _ = await self.execute(remote_cmd)
             return out.strip() == "1"
