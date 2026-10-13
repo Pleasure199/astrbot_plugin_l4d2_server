@@ -140,9 +140,8 @@ class ProcessManager:
                 f"服务器 '{server_name}' 启用了 SSH 模式，但未配置 ssh_host 或 ssh_username。"
             )
 
-        # Resolve server directory; remote is always Linux so force forward slashes
-        server_dir = config.srcds_path.replace("\\", "/")
-        if not server_dir:
+        raw_path = config.srcds_path.replace("\\", "/")
+        if not raw_path:
             return False, f"服务器 '{server_name}' 未配置 srcds_path（服务器目录）。"
 
         ssh = self._get_ssh_client(config)
@@ -152,8 +151,17 @@ class ProcessManager:
         if not ok:
             return False, f"SSH 连接失败: {msg}"
 
-        # Check remotely whether start.sh exists
-        _, out, _ = await ssh.execute(f"test -f {server_dir}/start.sh && echo 1 || echo 0")
+        # Remotely resolve the server directory: if srcds_path is a file,
+        # take its parent; if it's a directory, use it as-is.
+        _, out, _ = await ssh.execute(
+            f'if [ -d "{raw_path}" ]; then echo "{raw_path}"; else dirname "{raw_path}"; fi'
+        )
+        server_dir = out.strip()
+        if not server_dir or server_dir == ".":
+            return False, f"无法解析远程服务器目录: {raw_path}"
+
+        # Check remotely whether start.sh exists in the resolved directory
+        _, out, _ = await ssh.execute(f'test -f "{server_dir}/start.sh" && echo 1 || echo 0')
         has_start_sh = out.strip() == "1"
 
         if has_start_sh:
@@ -163,7 +171,7 @@ class ProcessManager:
             start_cmd = (
                 f"./srcds_run -game left4dead2 -port {config.port} "
                 f"+hostport {config.port} -maxplayers {config.max_players} "
-                f"+map {config.default_map} -console"
+                f"+map {config.default_map} +exec server.cfg -console"
             )
             launch_mode = "srcds 直接启动 (SSH远程)"
 
@@ -184,6 +192,7 @@ class ProcessManager:
         return True, (
             f"服务器 '{server_name}' 已通过 SSH 远程启动。\n"
             f"启动方式: {launch_mode}\n"
+            f"远程目录: {server_dir}\n"
             f"地图: {config.default_map} | 最大玩家: {config.max_players}\n"
             f"等待服务器就绪后可使用 /l4d2 status 查询状态。"
         )
