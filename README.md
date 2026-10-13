@@ -31,45 +31,29 @@ AstrBot 插件 — 通过 QQ 机器人远程管理求生之路 2（Left 4 Dead 2
 
 ### servers（服务器列表）
 
-数组类型，每个元素为一个服务器配置对象：
+使用模板化列表编辑器，点击「添加」→「L4D2 专用服务器」即可创建一台服务器配置。每台服务器包含以下字段：
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| name | string | — | 服务器唯一标识名，用于命令中指定 |
-| host | string | 127.0.0.1 | 服务器 IP 地址 |
+| name | string | — | 服务器标识名，用于指令中指定（如 `/l4d2 start 服务器名`） |
+| host | string | 127.0.0.1 | 服务器 IP 地址（RCON 连接地址） |
 | port | int | 27015 | 游戏端口 |
 | rcon_port | int | 27015 | RCON 端口（通常与游戏端口相同） |
-| rcon_password | string | — | RCON 密码 |
+| rcon_password | string | — | RCON 密码（密码掩码显示，需与 server.cfg 一致） |
 | srcds_path | string | — | srcds.exe（Windows）或 srcds_run（Linux）的完整路径 |
-| start_params | string | — | 额外启动参数，如 `-tickrate 100` |
+| start_params | string | — | 额外启动参数，如 `-tickrate 100 +mp_gamemode versus` |
 | max_players | int | 8 | 最大玩家数 |
 | default_map | string | c2m1_highway | 启动时加载的地图 |
 
-示例配置：
+> 配置卡片标题会自动显示服务器的 `name` 字段，方便快速识别多台服务器。
 
-```json
-[
-  {
-    "name": "my_server",
-    "host": "127.0.0.1",
-    "port": 27015,
-    "rcon_port": 27015,
-    "rcon_password": "your_rcon_password",
-    "srcds_path": "C:\\l4d2\\srcds.exe",
-    "start_params": "",
-    "max_players": 8,
-    "default_map": "c2m1_highway"
-  }
-]
-```
+### admins（管理员 QQ 号）
 
-### admins（管理员列表）
-
-字符串数组，填写管理员的 QQ 号。只有列表中的用户可以执行启动/停止/重启/踢人/切图/改难度等高危操作。
+字符串列表，填写管理员的 QQ 号。只有列表中的用户可以执行启动/停止/重启/踢人/切图/改难度等高危操作。
 
 ### allow_public_query（允许公开查询）
 
-布尔值，默认 `true`。开启后所有群成员可使用 `list`、`status`、`players` 等查询命令；关闭后仅管理员可查询。
+布尔值，默认 `true`。开启后所有人可使用 `list`、`status`、`players` 等查询命令；关闭后仅管理员可查询。
 
 ## 指令列表
 

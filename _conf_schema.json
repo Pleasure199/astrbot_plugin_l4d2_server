@@ -1,23 +1,74 @@
 {
   "servers": {
-    "description": "L4D2 服务器列表。每个元素为一个服务器配置对象，包含 name、host、port、rcon_port、rcon_password、srcds_path、start_params、max_players、default_map 字段。",
-    "type": "list",
-    "default": [
-      {
-        "name": "default",
-        "host": "127.0.0.1",
-        "port": 27015,
-        "rcon_port": 27015,
-        "rcon_password": "",
-        "srcds_path": "",
-        "start_params": "",
-        "max_players": 8,
-        "default_map": "c2m1_highway"
+    "description": "L4D2 服务器列表",
+    "hint": "点击「添加」创建服务器配置，支持多台服务器同时管理",
+    "type": "template_list",
+    "default": [],
+    "templates": {
+      "l4d2_server": {
+        "name": "L4D2 专用服务器",
+        "hint": "配置一台 L4D2 专用服务器的连接与启动参数",
+        "display_item": "name",
+        "items": {
+          "name": {
+            "type": "string",
+            "description": "服务器标识名",
+            "hint": "用于指令中指定服务器，如 /l4d2 start 服务器名",
+            "default": ""
+          },
+          "host": {
+            "type": "string",
+            "description": "服务器 IP",
+            "hint": "RCON 连接地址，本机填 127.0.0.1",
+            "default": "127.0.0.1"
+          },
+          "port": {
+            "type": "int",
+            "description": "游戏端口",
+            "default": 27015
+          },
+          "rcon_port": {
+            "type": "int",
+            "description": "RCON 端口",
+            "hint": "通常与游戏端口相同",
+            "default": 27015
+          },
+          "rcon_password": {
+            "type": "string",
+            "description": "RCON 密码",
+            "hint": "需与服务器 server.cfg 中的 rcon_password 一致",
+            "default": "",
+            "secret": true
+          },
+          "srcds_path": {
+            "type": "string",
+            "description": "srcds 可执行文件路径",
+            "hint": "Windows 填 srcds.exe 完整路径；Linux 填 srcds_run 路径",
+            "default": ""
+          },
+          "start_params": {
+            "type": "string",
+            "description": "额外启动参数",
+            "hint": "如 -tickrate 100 +mp_gamemode versus，可留空",
+            "default": ""
+          },
+          "max_players": {
+            "type": "int",
+            "description": "最大玩家数",
+            "default": 8
+          },
+          "default_map": {
+            "type": "string",
+            "description": "启动默认地图",
+            "default": "c2m1_highway"
+          }
+        }
       }
-    ]
+    }
   },
   "admins": {
-    "description": "管理员 QQ 号列表。只有列表中的用户可以执行启动/停止/重启/踢人/切图/改难度等高危操作。",
+    "description": "管理员 QQ 号",
+    "hint": "列表中的用户可执行启停、踢人、切图等管理操作",
     "type": "list",
     "default": [],
     "items": {
@@ -25,7 +76,8 @@
     }
   },
   "allow_public_query": {
-    "description": "允许所有人查询服务器状态（list / status / players）。关闭后仅管理员可使用查询命令。",
+    "description": "允许公开查询",
+    "hint": "开启后所有人可使用 list / status / players；关闭后仅管理员可查询",
     "type": "bool",
     "default": true
   }
