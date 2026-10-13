@@ -40,12 +40,14 @@ AstrBot 插件 — 通过 QQ 机器人远程管理求生之路 2（Left 4 Dead 2
 | port | int | 27015 | 游戏端口 |
 | rcon_port | int | 27015 | RCON 端口（通常与游戏端口相同） |
 | rcon_password | string | — | RCON 密码（密码掩码显示，需与 server.cfg 一致） |
-| srcds_path | string | — | srcds.exe（Windows）或 srcds_run（Linux）的完整路径 |
+| srcds_path | string | — | srcds.exe（Windows）或 srcds_run（Linux）的完整路径，用于定位服务器目录 |
 | start_params | string | — | 额外启动参数，如 `-tickrate 100 +mp_gamemode versus` |
 | max_players | int | 8 | 最大玩家数 |
 | default_map | string | c2m1_highway | 启动时加载的地图 |
 
 > 配置卡片标题会自动显示服务器的 `name` 字段，方便快速识别多台服务器。
+
+> **启动方式优先级**：若 `srcds_path` 所在目录下存在 `start.sh`（Linux）或 `start.bat`（Windows），插件将优先执行该脚本启动服务器（`start_params` 会作为参数传入脚本）；脚本不存在时才回退为直接调用 srcds 并拼接端口、地图等参数。启动成功后会在回复中注明使用的是哪种方式。
 
 ### admins（管理员 QQ 号）
 

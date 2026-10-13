@@ -107,14 +107,35 @@ class ProcessManager:
             if self._processes[name].poll() is None
         }
 
-    def _build_start_command(self, config: ServerConfig) -> list[str]:
-        """Build the command-line arguments for starting srcds.
+    def _find_start_script(self, srcds_path: str) -> Optional[Path]:
+        """Find a startup script in the server directory.
+
+        Checks for ``start.sh`` on Linux/macOS and ``start.bat`` on Windows.
+        The script must reside in the same directory as the srcds executable.
+
+        Args:
+            srcds_path: Path to the srcds executable.
+
+        Returns:
+            Path to the start script if found, None otherwise.
+        """
+        server_dir = Path(srcds_path).parent
+        script_name = "start.bat" if is_windows() else "start.sh"
+        script_path = server_dir / script_name
+        return script_path if script_path.is_file() else None
+
+    def _build_start_command(self, config: ServerConfig) -> tuple[list[str], Path]:
+        """Build the command-line arguments and working directory for starting the server.
+
+        If a ``start.sh`` (Linux) or ``start.bat`` (Windows) script exists in
+        the server directory, it is used preferentially. Otherwise the command
+        is built from the srcds executable and configured parameters.
 
         Args:
             config: Server configuration.
 
         Returns:
-            List of command-line arguments.
+            A tuple of (command_args, working_directory).
 
         Raises:
             ValueError: If srcds_path is not configured.
@@ -124,6 +145,19 @@ class ProcessManager:
                 f"服务器 '{config.name}' 未配置 srcds_path，无法启动。"
             )
 
+        # Prefer start.sh / start.bat if present in the server directory
+        start_script = self._find_start_script(config.srcds_path)
+        if start_script is not None:
+            if is_windows():
+                cmd = ["cmd", "/c", str(start_script)]
+            else:
+                cmd = ["/bin/bash", str(start_script)]
+            # Pass user-defined start parameters to the script
+            if config.start_params:
+                cmd.extend(shlex.split(config.start_params))
+            return cmd, start_script.parent
+
+        # Fall back to direct srcds invocation
         srcds = Path(config.srcds_path)
         base_args = [
             str(srcds),
@@ -144,7 +178,7 @@ class ProcessManager:
         if config.start_params:
             base_args.extend(shlex.split(config.start_params))
 
-        return base_args
+        return base_args, srcds.parent
 
     async def start(
         self, server_name: str, extra_params: str = ""
@@ -178,12 +212,20 @@ class ProcessManager:
                 config = dataclasses.replace(config, start_params=merged)
 
             try:
-                cmd = self._build_start_command(config)
+                cmd, work_dir = self._build_start_command(config)
             except ValueError as e:
                 return False, str(e)
 
-            # Verify the executable exists
-            if not os.path.isfile(cmd[0]):
+            # Determine launch mode for the user-facing message
+            start_script = self._find_start_script(config.srcds_path)
+            using_script = start_script is not None
+            launch_mode = (
+                f"启动脚本: {start_script.name}" if using_script else "srcds 直接启动"
+            )
+
+            # Verify the primary executable exists (for srcds mode only;
+            # /bin/bash and cmd are always present on their respective platforms)
+            if not using_script and not os.path.isfile(cmd[0]):
                 return False, f"找不到 srcds 可执行文件: {cmd[0]}"
 
             try:
@@ -197,17 +239,19 @@ class ProcessManager:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     creationflags=creationflags,
-                    cwd=str(Path(cmd[0]).parent),
+                    cwd=str(work_dir),
                 )
                 self._processes[server_name] = proc
                 logger.info(
-                    "Started L4D2 server '%s' (PID %d): %s",
+                    "Started L4D2 server '%s' (PID %d) via %s: %s",
                     server_name,
                     proc.pid,
+                    launch_mode,
                     " ".join(cmd),
                 )
                 return True, (
                     f"服务器 '{server_name}' 已启动 (PID: {proc.pid})。\n"
+                    f"启动方式: {launch_mode}\n"
                     f"地图: {config.default_map} | 最大玩家: {config.max_players}\n"
                     f"等待服务器就绪后可使用 /l4d2 status 查询状态。"
                 )

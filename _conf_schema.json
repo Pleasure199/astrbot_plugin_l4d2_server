@@ -43,7 +43,7 @@
           "srcds_path": {
             "type": "string",
             "description": "srcds 可执行文件路径",
-            "hint": "Windows 填 srcds.exe 完整路径；Linux 填 srcds_run 路径",
+            "hint": "用于定位服务器目录；若该目录下存在 start.sh（Linux）或 start.bat（Windows），将优先使用脚本启动",
             "default": ""
           },
           "start_params": {
