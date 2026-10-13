@@ -107,11 +107,30 @@ class ProcessManager:
             if self._processes[name].poll() is None
         }
 
+    @staticmethod
+    def _normalize_path(path_str: str) -> str:
+        """Normalize path separators for the current platform.
+
+        On non-Windows platforms, converts backslashes to forward slashes
+        to handle paths copied from Windows Explorer (e.g. ``\\home\\l4d2``
+        becomes ``/home/l4d2``).
+
+        Args:
+            path_str: Raw path string from configuration.
+
+        Returns:
+            Normalized path string.
+        """
+        if not is_windows():
+            return path_str.replace("\\", "/")
+        return path_str
+
     def _resolve_server_dir(self, srcds_path: str) -> Path:
         """Resolve the server directory from a srcds_path config value.
 
         Accepts either a path to the srcds executable (uses its parent)
-        or a path to the server directory itself (used as-is).
+        or a path to the server directory itself (used as-is). Paths with
+        Windows-style backslashes are normalized on non-Windows platforms.
 
         Args:
             srcds_path: Configured srcds path, may be a file or directory.
@@ -119,7 +138,7 @@ class ProcessManager:
         Returns:
             The resolved server directory Path.
         """
-        path = Path(srcds_path)
+        path = Path(self._normalize_path(srcds_path))
         return path if path.is_dir() else path.parent
 
     def _find_start_script(self, srcds_path: str) -> Optional[Path]:
@@ -182,7 +201,7 @@ class ProcessManager:
             return cmd, start_script.parent
 
         # No start script found: fall back to direct srcds invocation
-        srcds = Path(config.srcds_path)
+        srcds = Path(self._normalize_path(config.srcds_path))
         if srcds.is_dir():
             raise ValueError(
                 f"服务器 '{config.name}' 的 srcds_path 指向目录 '{srcds}'，"
@@ -259,6 +278,14 @@ class ProcessManager:
             if not using_script and not os.path.isfile(cmd[0]):
                 server_dir = self._resolve_server_dir(config.srcds_path)
                 script_name = "start.bat / start.sh" if is_windows() else "start.sh"
+                normalized = self._normalize_path(config.srcds_path)
+                sep_hint = ""
+                if "\\" in config.srcds_path and not is_windows():
+                    sep_hint = (
+                        f"\n  3. 检测到路径使用了反斜杠 (\\)，在 Linux 上请使用正斜杠 (/)："
+                        f"\n     原路径: {config.srcds_path}"
+                        f"\n     规范化后: {normalized}"
+                    )
                 return False, (
                     f"找不到 srcds 可执行文件: {cmd[0]}\n"
                     f"已检查的服务器目录: {server_dir}\n"
@@ -266,6 +293,7 @@ class ProcessManager:
                     f"请确认：\n"
                     f"  1. srcds_path 指向正确的 srcds 可执行文件，或服务器目录\n"
                     f"  2. 若使用启动脚本，确保脚本名为 {script_name} 且位于服务器目录下"
+                    f"{sep_hint}"
                 )
 
             try:
