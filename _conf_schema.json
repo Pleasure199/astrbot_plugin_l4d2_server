@@ -1,0 +1,32 @@
+{
+  "servers": {
+    "description": "L4D2 服务器列表。每个元素为一个服务器配置对象，包含 name、host、port、rcon_port、rcon_password、srcds_path、start_params、max_players、default_map 字段。",
+    "type": "list",
+    "default": [
+      {
+        "name": "default",
+        "host": "127.0.0.1",
+        "port": 27015,
+        "rcon_port": 27015,
+        "rcon_password": "",
+        "srcds_path": "",
+        "start_params": "",
+        "max_players": 8,
+        "default_map": "c2m1_highway"
+      }
+    ]
+  },
+  "admins": {
+    "description": "管理员 QQ 号列表。只有列表中的用户可以执行启动/停止/重启/踢人/切图/改难度等高危操作。",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    }
+  },
+  "allow_public_query": {
+    "description": "允许所有人查询服务器状态（list / status / players）。关闭后仅管理员可使用查询命令。",
+    "type": "bool",
+    "default": true
+  }
+}

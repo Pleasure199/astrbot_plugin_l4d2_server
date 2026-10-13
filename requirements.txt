@@ -1,0 +1,2 @@
+python-valve>=0.2.1
+psutil>=5.9.0
