@@ -61,6 +61,41 @@
             "type": "string",
             "description": "启动默认地图",
             "default": "c2m1_highway"
+          },
+          "ssh_enabled": {
+            "type": "bool",
+            "description": "启用 SSH 远程管理",
+            "hint": "AstrBot 与服务器不在同一台机器时开启，通过 SSH 执行启停命令",
+            "default": false
+          },
+          "ssh_host": {
+            "type": "string",
+            "description": "SSH 主机地址",
+            "hint": "远程服务器的 IP 或域名",
+            "default": ""
+          },
+          "ssh_port": {
+            "type": "int",
+            "description": "SSH 端口",
+            "default": 22
+          },
+          "ssh_username": {
+            "type": "string",
+            "description": "SSH 用户名",
+            "default": ""
+          },
+          "ssh_password": {
+            "type": "string",
+            "description": "SSH 密码",
+            "hint": "密码认证时填写；使用密钥认证时可作为密钥口令",
+            "default": "",
+            "secret": true
+          },
+          "ssh_key_path": {
+            "type": "string",
+            "description": "SSH 私钥路径",
+            "hint": "可选，使用密钥认证时填写私钥文件的本地路径",
+            "default": ""
           }
         }
       }

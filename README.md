@@ -44,10 +44,32 @@ AstrBot 插件 — 通过 QQ 机器人远程管理求生之路 2（Left 4 Dead 2
 | start_params | string | — | 额外启动参数，如 `-tickrate 100 +mp_gamemode versus` |
 | max_players | int | 8 | 最大玩家数 |
 | default_map | string | c2m1_highway | 启动时加载的地图 |
+| ssh_enabled | bool | false | 启用 SSH 远程管理（AstrBot 与服务器不在同一台机器时开启） |
+| ssh_host | string | — | SSH 主机地址（远程服务器 IP 或域名） |
+| ssh_port | int | 22 | SSH 端口 |
+| ssh_username | string | — | SSH 登录用户名 |
+| ssh_password | string | — | SSH 密码（密码掩码显示） |
+| ssh_key_path | string | — | SSH 私钥文件本地路径（可选，替代密码认证） |
 
 > 配置卡片标题会自动显示服务器的 `name` 字段，方便快速识别多台服务器。
 
 > **启动方式优先级**：`srcds_path` 可填服务器目录或 srcds 可执行文件路径。若对应目录下存在 `start.sh`（Linux）或 `start.bat` / `start.sh`（Windows），插件将优先执行该脚本启动服务器（`start_params` 会作为参数传入脚本）；脚本不存在时才回退为直接调用 srcds 并拼接端口、地图等参数。启动成功后会在回复中注明使用的是哪种方式。
+
+### SSH 远程管理（AstrBot 与服务器不在同一台机器）
+
+当 AstrBot 运行在 Windows 桌面版，而 L4D2 服务器部署在远程 Linux 机器上时，启用 SSH 模式：
+
+1. 在服务器配置中打开 `ssh_enabled`
+2. 填写 `ssh_host`、`ssh_port`、`ssh_username`、`ssh_password`（或 `ssh_key_path`）
+3. `srcds_path` 填写远程服务器上的目录路径（如 `/home/l4d2/Steam/l4d2server`）
+4. 确保远程服务器的 SSH 端口对 AstrBot 所在机器开放
+
+启用后：
+- `/l4d2 start` 通过 SSH 在远程服务器上执行启动命令（优先使用 `start.sh`，使用 `nohup` 后台运行）
+- `/l4d2 stop` 优先通过 RCON 发送 `quit`，再通过 SSH `pkill` 兜底
+- `/l4d2 status`、`players`、`say`、`kick`、`map`、`diff` 等 RCON 命令不受影响，始终通过网络连接
+
+> **依赖**：SSH 模式需要 `paramiko` 库，已包含在 `requirements.txt` 中。
 
 ### admins（管理员 QQ 号）
 

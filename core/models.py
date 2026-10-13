@@ -19,6 +19,12 @@ class ServerConfig:
         start_params: Additional start parameters appended to the base command.
         max_players: Maximum number of players allowed on the server.
         default_map: Map to load on server start.
+        ssh_enabled: Whether to manage the server via SSH (for remote servers).
+        ssh_host: SSH server hostname or IP.
+        ssh_port: SSH port (default 22).
+        ssh_username: SSH login username.
+        ssh_password: SSH login password (or passphrase for key).
+        ssh_key_path: Path to SSH private key file (alternative to password).
     """
 
     name: str
@@ -30,6 +36,12 @@ class ServerConfig:
     start_params: str = ""
     max_players: int = 8
     default_map: str = "c2m1_highway"
+    ssh_enabled: bool = False
+    ssh_host: str = ""
+    ssh_port: int = 22
+    ssh_username: str = ""
+    ssh_password: str = ""
+    ssh_key_path: str = ""
 
     @classmethod
     def from_dict(cls, data: dict) -> "ServerConfig":
@@ -51,6 +63,12 @@ class ServerConfig:
             start_params=str(data.get("start_params", "")),
             max_players=int(data.get("max_players", 8)),
             default_map=str(data.get("default_map", "c2m1_highway")),
+            ssh_enabled=bool(data.get("ssh_enabled", False)),
+            ssh_host=str(data.get("ssh_host", "")),
+            ssh_port=int(data.get("ssh_port", 22)),
+            ssh_username=str(data.get("ssh_username", "")),
+            ssh_password=str(data.get("ssh_password", "")),
+            ssh_key_path=str(data.get("ssh_key_path", "")),
         )
 
 

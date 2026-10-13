@@ -18,6 +18,7 @@ from typing import Optional
 
 from .models import ServerConfig
 from .rcon_client import RconClient
+from .ssh_client import SshClient
 from .utils import is_linux, is_windows
 
 logger = logging.getLogger("astrbot")
@@ -48,6 +49,7 @@ class ProcessManager:
         self.servers: dict[str, ServerConfig] = {s.name: s for s in servers}
         self._processes: dict[str, subprocess.Popen] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        self._ssh_running: set[str] = set()
 
     def _get_lock(self, server_name: str) -> asyncio.Lock:
         """Get or create an async lock for the given server.
@@ -84,28 +86,172 @@ class ProcessManager:
     def is_running(self, server_name: str) -> bool:
         """Check if a server process is currently running.
 
+        For locally-managed servers, checks the tracked Popen object.
+        For SSH-managed servers, checks the local running-state set.
+
         Args:
             server_name: Name of the server.
 
         Returns:
             True if the process is running, False otherwise.
         """
+        config = self.servers.get(server_name)
+        if config is not None and config.ssh_enabled:
+            return server_name in self._ssh_running
         proc = self._processes.get(server_name)
         if proc is None:
             return False
         return proc.poll() is None
 
+    def _get_ssh_client(self, config: ServerConfig) -> SshClient:
+        """Create an SshClient from a server's SSH configuration.
+
+        Args:
+            config: Server configuration with SSH fields populated.
+
+        Returns:
+            A configured SshClient instance.
+        """
+        return SshClient(
+            host=config.ssh_host,
+            port=config.ssh_port,
+            username=config.ssh_username,
+            password=config.ssh_password,
+            key_path=config.ssh_key_path,
+        )
+
+    async def _start_via_ssh(
+        self, config: ServerConfig, server_name: str
+    ) -> tuple[bool, str]:
+        """Start the server on a remote Linux machine via SSH.
+
+        Resolves the server directory, checks for a start.sh script remotely,
+        and launches the server with nohup so it survives disconnection.
+
+        Args:
+            config: Server configuration (with extra_params already merged).
+            server_name: Name of the server (for messages and state tracking).
+
+        Returns:
+            A tuple of (success, message).
+        """
+        if not config.ssh_host or not config.ssh_username:
+            return False, (
+                f"服务器 '{server_name}' 启用了 SSH 模式，但未配置 ssh_host 或 ssh_username。"
+            )
+
+        # Resolve server directory; remote is always Linux so force forward slashes
+        server_dir = config.srcds_path.replace("\\", "/")
+        if not server_dir:
+            return False, f"服务器 '{server_name}' 未配置 srcds_path（服务器目录）。"
+
+        ssh = self._get_ssh_client(config)
+
+        # Test connection first
+        ok, msg = await ssh.test_connection()
+        if not ok:
+            return False, f"SSH 连接失败: {msg}"
+
+        # Check remotely whether start.sh exists
+        _, out, _ = await ssh.execute(f"test -f {server_dir}/start.sh && echo 1 || echo 0")
+        has_start_sh = out.strip() == "1"
+
+        if has_start_sh:
+            start_cmd = "bash start.sh"
+            launch_mode = "启动脚本: start.sh (SSH远程)"
+        else:
+            start_cmd = (
+                f"./srcds_run -game left4dead2 -port {config.port} "
+                f"+hostport {config.port} -maxplayers {config.max_players} "
+                f"+map {config.default_map} -console"
+            )
+            launch_mode = "srcds 直接启动 (SSH远程)"
+
+        # Append user-defined start parameters
+        if config.start_params:
+            start_cmd = f"{start_cmd} {config.start_params}"
+
+        ok, msg = await ssh.start_server(server_dir, start_cmd)
+        if not ok:
+            return False, f"远程启动失败: {msg}"
+
+        self._ssh_running.add(server_name)
+        logger.info(
+            "Started L4D2 server '%s' remotely via SSH: %s",
+            server_name,
+            start_cmd,
+        )
+        return True, (
+            f"服务器 '{server_name}' 已通过 SSH 远程启动。\n"
+            f"启动方式: {launch_mode}\n"
+            f"地图: {config.default_map} | 最大玩家: {config.max_players}\n"
+            f"等待服务器就绪后可使用 /l4d2 status 查询状态。"
+        )
+
+    async def _stop_via_ssh(
+        self,
+        config: ServerConfig,
+        server_name: str,
+        rcon_client: Optional[RconClient],
+        force: bool,
+    ) -> tuple[bool, str]:
+        """Stop the server on a remote Linux machine via SSH.
+
+        Attempts graceful shutdown via RCON 'quit' first, then falls back
+        to SSH pkill. Updates the local SSH running-state set.
+
+        Args:
+            config: Server configuration.
+            server_name: Name of the server.
+            rcon_client: Optional RCON client for graceful shutdown.
+            force: If True, skip RCON graceful shutdown.
+
+        Returns:
+            A tuple of (success, message).
+        """
+        if server_name not in self._ssh_running:
+            return False, f"服务器 '{server_name}' 未在运行。"
+
+        # Attempt graceful shutdown via RCON
+        if not force and rcon_client is not None:
+            try:
+                await rcon_client.quit()
+                logger.info(
+                    "Sent RCON quit to SSH server '%s', waiting for shutdown...",
+                    server_name,
+                )
+                await asyncio.sleep(GRACEFUL_SHUTDOWN_TIMEOUT)
+            except Exception as e:
+                logger.warning(
+                    "RCON quit failed for SSH server '%s': %s, "
+                    "falling back to pkill.",
+                    server_name,
+                    e,
+                )
+
+        # Force kill via SSH
+        ssh = self._get_ssh_client(config)
+        ok, msg = await ssh.stop_server(config.srcds_path)
+        self._ssh_running.discard(server_name)
+        if ok:
+            return True, f"服务器 '{server_name}' 已通过 SSH 远程停止。"
+        return False, f"远程停止失败: {msg}"
+
     def get_running_servers(self) -> set[str]:
         """Return the set of server names that are currently running.
+
+        Includes both locally-managed processes and SSH-managed servers
+        tracked in the running-state set.
 
         Returns:
             Set of running server names.
         """
-        return {
+        local = {
             name
             for name in self._processes
             if self._processes[name].poll() is None
         }
+        return local | self._ssh_running
 
     @staticmethod
     def _normalize_path(path_str: str) -> str:
@@ -261,6 +407,10 @@ class ProcessManager:
                     merged = extra_params.strip()
                 config = dataclasses.replace(config, start_params=merged)
 
+            # --- SSH remote mode ---
+            if config.ssh_enabled:
+                return await self._start_via_ssh(config, server_name)
+
             try:
                 cmd, work_dir = self._build_start_command(config)
             except ValueError as e:
@@ -352,6 +502,14 @@ class ProcessManager:
         """
         lock = self._get_lock(server_name)
         async with lock:
+            config = self.get_server(server_name)
+
+            # --- SSH remote mode ---
+            if config is not None and config.ssh_enabled:
+                return await self._stop_via_ssh(
+                    config, server_name, rcon_client, force
+                )
+
             proc = self._processes.get(server_name)
             if proc is None or proc.poll() is not None:
                 # Process not tracked or already exited
