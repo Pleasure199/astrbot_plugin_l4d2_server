@@ -88,7 +88,7 @@ class SshClient:
         return client
 
     async def execute(self, command: str) -> tuple[int, str, str]:
-        """Execute a command on the remote server.
+        """Execute a command on the remote server and wait for completion.
 
         Args:
             command: Shell command to execute.
@@ -101,6 +101,30 @@ class SshClient:
         """
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._execute_sync, command)
+
+    async def execute_no_wait(self, command: str) -> None:
+        """Send a command to the remote server without waiting for completion.
+
+        Useful for launching long-running background processes where waiting
+        for the SSH channel to close would block indefinitely.
+
+        Args:
+            command: Shell command to execute.
+        """
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._execute_no_wait_sync, command)
+
+    def _execute_no_wait_sync(self, command: str) -> None:
+        """Send a command without reading output or exit status.
+
+        Args:
+            command: Shell command to execute.
+        """
+        client = self._connect_sync()
+        try:
+            client.exec_command(command, timeout=self.timeout)
+        finally:
+            client.close()
 
     def _execute_sync(self, command: str) -> tuple[int, str, str]:
         """Execute a command synchronously.
@@ -135,16 +159,25 @@ class SshClient:
         Returns:
             A tuple of (success, message).
         """
-        # Use nohup and redirect output so the process survives disconnection
+        # Use setsid for full session detachment, redirect all FDs so the
+        # SSH channel can close immediately without waiting on the child.
         remote_cmd = (
-            f"cd {server_dir} && nohup {start_command} "
-            f"> /dev/null 2>&1 & echo $!"
+            f"cd {server_dir} && setsid nohup {start_command} "
+            f"> /dev/null 2>&1 < /dev/null &"
         )
-        exit_code, out, err = await self.execute(remote_cmd)
-        if exit_code == 0 and out:
-            pid = out.strip().split("\n")[-1]
-            return True, f"远程服务器已启动 (PID: {pid})"
-        return False, f"启动失败: {err or '未知错误'}"
+        try:
+            await self.execute_no_wait(remote_cmd)
+        except Exception as e:
+            return False, f"启动命令发送失败: {e}"
+
+        # Give the process a moment to spawn, then verify it is running
+        await asyncio.sleep(3)
+        if await self.is_running():
+            return True, "远程服务器已启动"
+        return False, (
+            "启动命令已发送，但未检测到 srcds 进程。"
+            "请检查 start.sh 是否有执行权限、参数是否正确。"
+        )
 
     async def stop_server(self, server_dir: str) -> tuple[bool, str]:
         """Stop the L4D2 server process on the remote machine.
