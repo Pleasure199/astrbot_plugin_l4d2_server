@@ -11,15 +11,19 @@ import dataclasses
 import logging
 import os
 import shlex
-import signal
 import subprocess
+import time
 from pathlib import Path
-from typing import Optional
 
 from .models import ServerConfig
 from .rcon_client import RconClient
 from .ssh_client import SshClient
-from .utils import is_linux, is_windows
+from .utils import is_windows
+
+try:
+    import psutil
+except ImportError:  # pragma: no cover - psutil is a declared dependency
+    psutil = None
 
 logger = logging.getLogger("astrbot")
 
@@ -27,6 +31,10 @@ logger = logging.getLogger("astrbot")
 GRACEFUL_SHUTDOWN_TIMEOUT = 15
 # Time to wait for process to terminate after SIGTERM (seconds)
 TERMINATE_TIMEOUT = 10
+# Upper bound for probing SSH servers while the plugin loads (seconds)
+SSH_STATE_PROBE_TIMEOUT = 20
+# The srcds process name always contains this token (srcds.exe / srcds_run / srcds_linux)
+SRCDS_MATCH_TOKEN = "srcds"
 
 
 class ProcessManager:
@@ -64,7 +72,7 @@ class ProcessManager:
             self._locks[server_name] = asyncio.Lock()
         return self._locks[server_name]
 
-    def get_server(self, server_name: str) -> Optional[ServerConfig]:
+    def get_server(self, server_name: str) -> ServerConfig | None:
         """Get the configuration for a named server.
 
         Args:
@@ -86,8 +94,9 @@ class ProcessManager:
     def is_running(self, server_name: str) -> bool:
         """Check if a server process is currently running.
 
-        For locally-managed servers, checks the tracked Popen object.
-        For SSH-managed servers, checks the local running-state set.
+        For locally-managed servers, checks the tracked Popen object and falls
+        back to searching for the srcds process itself. For SSH-managed servers,
+        checks the local running-state set.
 
         Args:
             server_name: Name of the server.
@@ -99,9 +108,60 @@ class ProcessManager:
         if config is not None and config.ssh_enabled:
             return server_name in self._ssh_running
         proc = self._processes.get(server_name)
-        if proc is None:
-            return False
-        return proc.poll() is None
+        if proc is not None and proc.poll() is None:
+            return True
+        if proc is not None:
+            # The launcher exited (e.g. a start.bat that used "start"), so the
+            # handle is stale. Drop it and look for the real server process.
+            self._processes.pop(server_name, None)
+        return bool(self._find_server_processes(server_name))
+
+    def _find_server_processes(self, server_name: str) -> list:
+        """Find the local srcds processes that belong to a configured server.
+
+        The tracked ``Popen`` handle alone is not enough: AstrBot reloads the
+        plugin whenever its configuration is saved (which drops all in-memory
+        state), and a launcher script can exit while the server it spawned keeps
+        running. Matching on the server directory makes such servers manageable
+        again instead of leaving them unstoppable.
+
+        Args:
+            server_name: Name of the server.
+
+        Returns:
+            List of matching psutil.Process objects, empty when psutil is
+            unavailable, the server is SSH-managed, or nothing matches.
+        """
+        config = self.servers.get(server_name)
+        if psutil is None or config is None or config.ssh_enabled:
+            return []
+        if not config.srcds_path:
+            return []
+
+        server_dir = str(self._resolve_server_dir(config.srcds_path))
+        server_dir = server_dir.replace("\\", "/").lower()
+        srcds_path = self._normalize_path(config.srcds_path)
+        srcds_path = srcds_path.replace("\\", "/").lower()
+        port = config.port
+
+        found = []
+        for proc in psutil.process_iter(["name", "cmdline", "cwd"]):
+            name = (proc.info["name"] or "").lower()
+            cmdline = " ".join(proc.info["cmdline"] or [])
+            cmdline = cmdline.replace("\\", "/").lower()
+            if SRCDS_MATCH_TOKEN not in name and SRCDS_MATCH_TOKEN not in cmdline:
+                continue
+            cwd = (proc.info["cwd"] or "").replace("\\", "/").lower()
+            if (
+                cwd == server_dir
+                or server_dir in cmdline
+                or srcds_path in cmdline
+                or f"-port {port}" in cmdline
+                or f"-port={port}" in cmdline
+                or f"+hostport {port}" in cmdline
+            ):
+                found.append(proc)
+        return found
 
     def _get_ssh_client(self, config: ServerConfig) -> SshClient:
         """Create an SshClient from a server's SSH configuration.
@@ -119,6 +179,20 @@ class ProcessManager:
             password=config.ssh_password,
             key_path=config.ssh_key_path,
         )
+
+    def get_ssh_client(self, server_name: str) -> SshClient | None:
+        """Return an SSH client for a server, if it is SSH-managed.
+
+        Args:
+            server_name: Name of the server.
+
+        Returns:
+            A configured SshClient, or None when the server does not use SSH.
+        """
+        config = self.servers.get(server_name)
+        if config is None or not config.ssh_enabled:
+            return None
+        return self._get_ssh_client(config)
 
     async def _start_via_ssh(
         self, config: ServerConfig, server_name: str
@@ -151,17 +225,20 @@ class ProcessManager:
         if not ok:
             return False, f"SSH 连接失败: {msg}"
 
-        # Remotely resolve the server directory: if srcds_path is a file,
-        # take its parent; if it's a directory, use it as-is.
-        _, out, _ = await ssh.execute(
-            f'if [ -d "{raw_path}" ]; then echo "{raw_path}"; else dirname "{raw_path}"; fi'
-        )
-        server_dir = out.strip()
-        if not server_dir or server_dir == ".":
+        server_dir, _pgid = await ssh.read_server_state(raw_path)
+        if not server_dir:
             return False, f"无法解析远程服务器目录: {raw_path}"
 
+        # Never start a second instance: the in-memory running state is lost
+        # when the plugin is reloaded, so ask the remote host instead.
+        if await self._ssh_server_running(config, server_dir):
+            self._ssh_running.add(server_name)
+            return False, f"服务器 '{server_name}' 已经在运行中。"
+
         # Check remotely whether start.sh exists in the resolved directory
-        _, out, _ = await ssh.execute(f'test -f "{server_dir}/start.sh" && echo 1 || echo 0')
+        _, out, _ = await ssh.execute(
+            f'test -f "{server_dir}/start.sh" && echo 1 || echo 0'
+        )
         has_start_sh = out.strip() == "1"
 
         if has_start_sh:
@@ -201,13 +278,17 @@ class ProcessManager:
         self,
         config: ServerConfig,
         server_name: str,
-        rcon_client: Optional[RconClient],
+        rcon_client: RconClient | None,
         force: bool,
     ) -> tuple[bool, str]:
         """Stop the server on a remote Linux machine via SSH.
 
-        Attempts graceful shutdown via RCON 'quit' first, then falls back
-        to SSH pkill. Updates the local SSH running-state set.
+        The remote host is authoritative here, because the running-state cache
+        only lives in memory and is lost whenever the plugin is reloaded. The
+        method first asks the server to quit over RCON, then kills the process
+        group that was recorded when the server was started - which also takes
+        down any launcher that would restart it - and finally removes whatever
+        srcds process is still identified as belonging to this server.
 
         Args:
             config: Server configuration.
@@ -218,36 +299,110 @@ class ProcessManager:
         Returns:
             A tuple of (success, message).
         """
-        if server_name not in self._ssh_running:
+        ssh = self._get_ssh_client(config)
+        server_dir, pgid = await ssh.read_server_state(config.srcds_path)
+        if not server_dir:
+            return False, f"无法解析远程服务器目录: {config.srcds_path}"
+
+        processes = await ssh.list_srcds_processes()
+        matched = self._match_ssh_processes(server_dir, config.port, processes)
+        if not matched and (pgid is None or not await ssh.pid_alive(pgid)):
+            self._ssh_running.discard(server_name)
+            if processes:
+                listing = "\n".join(
+                    f"  PID {p['pid']} cwd={p['cwd']} args={p['args'][:80]}"
+                    for p in processes
+                )
+                return False, (
+                    f"未找到属于服务器 '{server_name}' 的 srcds 进程，"
+                    f"因此没有执行任何停止操作。\n"
+                    f"远程目录: {server_dir}\n"
+                    f"远程主机上现有的 srcds 进程：\n{listing}\n"
+                    f"如果其中有你的服务器，请把 srcds_path 改成它的实际运行目录。"
+                )
             return False, f"服务器 '{server_name}' 未在运行。"
 
-        # Attempt graceful shutdown via RCON
+        # --- Graceful shutdown via RCON ---
         if not force and rcon_client is not None:
-            try:
-                await rcon_client.quit()
-                logger.info(
-                    "Sent RCON quit to SSH server '%s', waiting for shutdown...",
-                    server_name,
-                )
-                await asyncio.sleep(GRACEFUL_SHUTDOWN_TIMEOUT)
-            except Exception as e:
-                logger.warning(
-                    "RCON quit failed for SSH server '%s': %s, "
-                    "falling back to pkill.",
-                    server_name,
-                    e,
-                )
+            await rcon_client.quit()
+            deadline = time.monotonic() + GRACEFUL_SHUTDOWN_TIMEOUT
+            while time.monotonic() < deadline:
+                if not await self._ssh_server_running(config, server_dir):
+                    await ssh.remove_pid_file(server_dir)
+                    self._ssh_running.discard(server_name)
+                    return True, f"服务器 '{server_name}' 已优雅停止。"
+                await asyncio.sleep(3)
+            logger.warning(
+                "SSH server '%s' did not exit after RCON quit, killing it.",
+                server_name,
+            )
 
-        # Force kill via SSH
-        ssh = self._get_ssh_client(config)
-        ok, msg = await ssh.stop_server(config.srcds_path)
+        # --- Kill the recorded process group, then any leftover srcds process ---
+        if pgid is not None:
+            await ssh.kill_targets(pgid, [])
+
+        leftovers = self._match_ssh_processes(server_dir, config.port, processes)
+        if leftovers:
+            await ssh.kill_targets(None, [p["pid"] for p in leftovers])
+            leftovers = self._match_ssh_processes(
+                server_dir, config.port, await ssh.list_srcds_processes()
+            )
+
+        await ssh.remove_pid_file(server_dir)
+        if leftovers:
+            pids = ", ".join(p["pid"] for p in leftovers)
+            return False, (
+                f"服务器 '{server_name}' 仍未停止，以下 srcds 进程还活着：{pids}\n"
+                f"远程目录: {server_dir}\n"
+                f"请确认 SSH 用户（{config.ssh_username}）有权限结束这些进程。"
+            )
         self._ssh_running.discard(server_name)
-        if ok:
-            return True, f"服务器 '{server_name}' 已通过 SSH 远程停止。"
-        return False, f"远程停止失败: {msg}"
+        return True, f"服务器 '{server_name}' 已通过 SSH 远程停止。"
+
+    @staticmethod
+    def _match_ssh_processes(
+        server_dir: str, port: int, processes: list[dict]
+    ) -> list[dict]:
+        """Pick the remote srcds processes that belong to one server.
+
+        Args:
+            server_dir: Resolved server directory on the remote host.
+            port: Game port of the server, used as a fallback selector.
+            processes: Result of ``SshClient.list_srcds_processes``.
+
+        Returns:
+            The matching process entries, empty when none belong to the server.
+        """
+        by_dir = [p for p in processes if server_dir and p["cwd"] == server_dir]
+        if by_dir:
+            return by_dir
+        # A start script may change into another directory, so fall back to the
+        # game port, which two servers on the same host cannot share.
+        if port:
+            needles = (f"-port {port}", f"-port={port}", f"+hostport {port}")
+            return [p for p in processes if any(n in p["args"] for n in needles)]
+        return []
+
+    async def _ssh_server_running(self, config: ServerConfig, server_dir: str) -> bool:
+        """Check on the remote host whether a server still has a live process.
+
+        Args:
+            config: Server configuration of an SSH-managed server.
+            server_dir: Resolved server directory on the remote host.
+
+        Returns:
+            True if the recorded process group is alive or a srcds process of
+            this server is still running.
+        """
+        ssh = self._get_ssh_client(config)
+        _server_dir, pgid = await ssh.read_server_state(server_dir)
+        if pgid is not None and await ssh.pid_alive(pgid):
+            return True
+        processes = await ssh.list_srcds_processes()
+        return bool(self._match_ssh_processes(server_dir, config.port, processes))
 
     def get_running_servers(self) -> set[str]:
-        """Return the set of server names that are currently running.
+        """Return the set of server names that currently have a running process.
 
         Includes both locally-managed processes and SSH-managed servers
         tracked in the running-state set.
@@ -255,12 +410,8 @@ class ProcessManager:
         Returns:
             Set of running server names.
         """
-        local = {
-            name
-            for name in self._processes
-            if self._processes[name].poll() is None
-        }
-        return local | self._ssh_running
+        names = set(self.servers) | set(self._processes)
+        return {name for name in names if self.is_running(name)}
 
     @staticmethod
     def _normalize_path(path_str: str) -> str:
@@ -296,7 +447,7 @@ class ProcessManager:
         path = Path(self._normalize_path(srcds_path))
         return path if path.is_dir() else path.parent
 
-    def _find_start_script(self, srcds_path: str) -> Optional[Path]:
+    def _find_start_script(self, srcds_path: str) -> Path | None:
         """Find a startup script in the server directory.
 
         On Linux/macOS checks for ``start.sh``. On Windows checks for
@@ -339,9 +490,7 @@ class ProcessManager:
                 points to a directory without a start script.
         """
         if not config.srcds_path:
-            raise ValueError(
-                f"服务器 '{config.name}' 未配置 srcds_path，无法启动。"
-            )
+            raise ValueError(f"服务器 '{config.name}' 未配置 srcds_path，无法启动。")
 
         # Prefer start.sh / start.bat if present in the server directory
         start_script = self._find_start_script(config.srcds_path)
@@ -385,9 +534,7 @@ class ProcessManager:
 
         return base_args, srcds.parent
 
-    async def start(
-        self, server_name: str, extra_params: str = ""
-    ) -> tuple[bool, str]:
+    async def start(self, server_name: str, extra_params: str = "") -> tuple[bool, str]:
         """Start a server process.
 
         Args:
@@ -456,16 +603,21 @@ class ProcessManager:
                 )
 
             try:
-                # On Windows, use CREATE_NEW_PROCESS_GROUP to allow clean termination
+                # Put the server in its own session / process group so it does
+                # not die together with AstrBot (for example on Ctrl+C) and so
+                # its children can be terminated as a group.
                 creationflags = 0
                 if is_windows():
                     creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
 
-                proc = subprocess.Popen(
+                # Popen is used instead of asyncio.create_subprocess_exec so the
+                # process can be polled and killed synchronously later on.
+                proc = subprocess.Popen(  # noqa: ASYNC220
                     cmd,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     creationflags=creationflags,
+                    start_new_session=not is_windows(),
                     cwd=str(work_dir),
                 )
                 self._processes[server_name] = proc
@@ -493,13 +645,14 @@ class ProcessManager:
     async def stop(
         self,
         server_name: str,
-        rcon_client: Optional[RconClient] = None,
+        rcon_client: RconClient | None = None,
         force: bool = False,
     ) -> tuple[bool, str]:
         """Stop a server process.
 
-        Attempts graceful shutdown via RCON 'quit' first, then falls back
-        to SIGTERM, and finally SIGKILL if the process does not exit.
+        Attempts a graceful shutdown via RCON 'quit' first, then force-kills the
+        whole process tree. Killing the tracked launcher alone is not enough,
+        because a start script spawns the actual server as a child process.
 
         Args:
             server_name: Name of the server to stop.
@@ -515,80 +668,127 @@ class ProcessManager:
 
             # --- SSH remote mode ---
             if config is not None and config.ssh_enabled:
-                return await self._stop_via_ssh(
-                    config, server_name, rcon_client, force
+                return await self._stop_via_ssh(config, server_name, rcon_client, force)
+
+            if not self.is_running(server_name):
+                return False, (
+                    f"未在本机检测到服务器 '{server_name}' 的进程，无法停止。\n"
+                    f"如果该服务器运行在其它机器上，请为它启用 SSH 远程管理："
+                    f"仅配置 RCON 无法结束远端进程。"
                 )
 
-            proc = self._processes.get(server_name)
-            if proc is None or proc.poll() is not None:
-                # Process not tracked or already exited
-                self._processes.pop(server_name, None)
-                return False, f"服务器 '{server_name}' 未在运行。"
-
-            # Attempt graceful shutdown via RCON
+            # Attempt a graceful shutdown via RCON. A single attempt is enough
+            # for 'quit', and a failure just means the kill below does the work.
             if not force and rcon_client is not None:
-                try:
-                    await rcon_client.quit()
-                    logger.info(
-                        "Sent RCON quit to server '%s', waiting for shutdown...",
-                        server_name,
-                    )
-                    # Wait for the process to exit gracefully
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.get_running_loop().run_in_executor(
-                                None, proc.wait
-                            ),
-                            timeout=GRACEFUL_SHUTDOWN_TIMEOUT,
-                        )
-                        self._processes.pop(server_name, None)
-                        return True, f"服务器 '{server_name}' 已优雅停止。"
-                    except asyncio.TimeoutError:
-                        logger.warning(
-                            "Server '%s' did not exit after RCON quit, "
-                            "falling back to terminate.",
-                            server_name,
-                        )
-                except Exception as e:
-                    logger.warning(
-                        "RCON quit failed for server '%s': %s, "
-                        "falling back to terminate.",
-                        server_name,
-                        e,
-                    )
+                await rcon_client.quit()
+                deadline = time.monotonic() + GRACEFUL_SHUTDOWN_TIMEOUT
+                # The server is external state, so its exit has to be polled.
+                while self.is_running(server_name) and time.monotonic() < deadline:  # noqa: ASYNC110
+                    await asyncio.sleep(1)
+                if not self.is_running(server_name):
+                    self._processes.pop(server_name, None)
+                    return True, f"服务器 '{server_name}' 已优雅停止。"
+                logger.warning(
+                    "Server '%s' did not exit after RCON quit, killing it.",
+                    server_name,
+                )
 
-            # Force terminate
-            try:
-                if is_windows():
-                    proc.terminate()
-                else:
-                    proc.send_signal(signal.SIGTERM)
-
-                try:
-                    await asyncio.wait_for(
-                        asyncio.get_running_loop().run_in_executor(
-                            None, proc.wait
-                        ),
-                        timeout=TERMINATE_TIMEOUT,
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "Server '%s' did not respond to SIGTERM, killing.",
-                        server_name,
-                    )
-                    proc.kill()
-                    proc.wait(timeout=5)
-
-                self._processes.pop(server_name, None)
+            # Force kill the whole process tree
+            stopped = await asyncio.get_running_loop().run_in_executor(
+                None, self._kill_local_server, server_name
+            )
+            self._processes.pop(server_name, None)
+            if stopped:
                 return True, f"服务器 '{server_name}' 已停止。"
+            return False, f"停止服务器 '{server_name}' 失败，请检查进程权限。"
+
+    def _kill_local_server(self, server_name: str) -> bool:
+        """Force-kill every local process that belongs to a server.
+
+        The tracked child is only a launcher in common setups (``cmd /c
+        start.bat`` on Windows, ``start.sh`` on Linux), so its children have to
+        be killed as well, otherwise the game server keeps running and cannot be
+        reached by stop any more.
+
+        Args:
+            server_name: Name of the server to kill.
+
+        Returns:
+            True if no process of the server is left running.
+        """
+        proc = self._processes.get(server_name)
+        if proc is not None and proc.poll() is not None:
+            self._processes.pop(server_name, None)
+            proc = None
+
+        if psutil is None:
+            # Without psutil only the directly spawned child can be stopped.
+            if proc is None:
+                return True
+            try:
+                proc.kill()
+                proc.wait(timeout=TERMINATE_TIMEOUT)
+                return True
             except Exception as e:
-                logger.exception("Failed to stop server '%s'", server_name)
-                return False, f"停止服务器失败: {e}"
+                logger.warning("Failed to kill server '%s': %s", server_name, e)
+                return False
+
+        # Two passes, because a start script that restarts the server would
+        # bring it back right after the first round of kills.
+        for _attempt in range(2):
+            pids = {p.pid for p in self._find_server_processes(server_name)}
+            if proc is not None and proc.poll() is None:
+                pids.add(proc.pid)
+
+            # Collect the tree up front: once the launcher is gone its children
+            # are re-parented and can no longer be found through it.
+            targets: dict[int, psutil.Process] = {}
+            for pid in pids:
+                try:
+                    root = psutil.Process(pid)
+                except psutil.Error:
+                    continue
+                targets[root.pid] = root
+                try:
+                    for child in root.children(recursive=True):
+                        targets[child.pid] = child
+                except psutil.Error:
+                    continue
+            if not targets:
+                return True
+
+            # Descendants first, so a launcher cannot respawn them.
+            ordered = list(reversed(list(targets.values())))
+            for target in ordered:
+                try:
+                    target.terminate()
+                except psutil.Error:
+                    pass
+            _, alive = psutil.wait_procs(ordered, timeout=TERMINATE_TIMEOUT)
+            for target in alive:
+                try:
+                    target.kill()
+                except psutil.Error:
+                    pass
+            psutil.wait_procs(alive, timeout=5)
+            if not self._find_server_processes(server_name):
+                return True
+
+        remaining = self._find_server_processes(server_name)
+        if remaining:
+            logger.warning(
+                "Could not stop %d process(es) of server '%s': %s",
+                len(remaining),
+                server_name,
+                [p.pid for p in remaining],
+            )
+            return False
+        return True
 
     async def restart(
         self,
         server_name: str,
-        rcon_client: Optional[RconClient] = None,
+        rcon_client: RconClient | None = None,
         extra_params: str = "",
     ) -> tuple[bool, str]:
         """Restart a server process.
@@ -609,9 +809,7 @@ class ProcessManager:
 
         # Stop if running
         if self.is_running(server_name):
-            stop_ok, stop_msg = await self.stop(
-                server_name, rcon_client=rcon_client
-            )
+            stop_ok, stop_msg = await self.stop(server_name, rcon_client=rcon_client)
             if not stop_ok:
                 return False, f"重启失败（停止阶段）: {stop_msg}"
             # Brief pause to ensure port is released
@@ -620,27 +818,53 @@ class ProcessManager:
         # Start
         return await self.start(server_name, extra_params=extra_params)
 
-    async def terminate_all(self) -> None:
-        """Terminate all managed server processes.
+    async def refresh_ssh_states(self) -> None:
+        """Re-detect which SSH-managed servers are running on their remote hosts.
 
-        Called during plugin shutdown to clean up child processes.
-        Uses force stop without RCON for quick cleanup.
+        The running-state set only lives in memory, so it is gone after a plugin
+        reload (AstrBot reloads the plugin on every config save). Probing the
+        remote hosts once keeps status queries and duplicate-start protection
+        accurate.
         """
-        for server_name in list(self._processes.keys()):
-            if self.is_running(server_name):
-                try:
-                    proc = self._processes[server_name]
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.wait(timeout=3)
-                    logger.info("Terminated server '%s' during plugin shutdown.", server_name)
-                except Exception as e:
-                    logger.warning(
-                        "Failed to terminate server '%s' during shutdown: %s",
-                        server_name,
-                        e,
-                    )
-        self._processes.clear()
+        pending = [
+            self._refresh_ssh_state(name, config)
+            for name, config in self.servers.items()
+            if config.ssh_enabled and config.ssh_host and config.ssh_username
+        ]
+        if not pending:
+            return
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True),
+                timeout=SSH_STATE_PROBE_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Timed out after %ds while probing SSH server states.",
+                SSH_STATE_PROBE_TIMEOUT,
+            )
+            return
+        for result in results:
+            if isinstance(result, BaseException):
+                logger.warning("Failed to probe an SSH server state: %s", result)
+
+    async def _refresh_ssh_state(self, server_name: str, config: ServerConfig) -> None:
+        """Probe one SSH-managed server and update the running-state set.
+
+        Args:
+            server_name: Name of the server.
+            config: Server configuration of an SSH-managed server.
+        """
+        ssh = self._get_ssh_client(config)
+        server_dir, pgid = await ssh.read_server_state(config.srcds_path)
+        if pgid is not None:
+            running = await ssh.pid_alive(pgid)
+        else:
+            processes = await ssh.list_srcds_processes()
+            running = bool(
+                self._match_ssh_processes(server_dir, config.port, processes)
+            )
+        if running:
+            self._ssh_running.add(server_name)
+        else:
+            self._ssh_running.discard(server_name)

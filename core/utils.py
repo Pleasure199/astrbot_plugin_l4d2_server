@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import re
 import platform
+import re
 
 from .models import PlayerInfo, ServerStatus
 
@@ -111,7 +111,7 @@ def format_status_message(status: ServerStatus, server_name: str) -> str:
         Formatted text message.
     """
     lines = [
-        f"=== L4D2 服务器状态 ===",
+        "=== L4D2 服务器状态 ===",
         f"服务器: {server_name}",
         f"主机名: {status.hostname or '未知'}",
         f"版本: {status.version or '未知'}",

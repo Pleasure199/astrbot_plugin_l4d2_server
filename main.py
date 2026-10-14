@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Optional
+from functools import partial
 
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
@@ -40,7 +40,7 @@ class L4D2ServerManager(Star):
     玩家管理等功能。支持多服务器实例、管理员权限控制和配置热加载。
     """
 
-    def __init__(self, context: Context, config: Optional[dict] = None) -> None:
+    def __init__(self, context: Context, config: dict | None = None) -> None:
         """Initialize the L4D2 server manager plugin.
 
         Args:
@@ -60,7 +60,7 @@ class L4D2ServerManager(Star):
         raw_servers = self.config.get("servers", [])
         configs = []
         for srv in raw_servers:
-            if isinstance(srv, dict) and srv.get("name"):
+            if isinstance(srv, dict) and str(srv.get("name", "")).strip():
                 configs.append(ServerConfig.from_dict(srv))
         return configs
 
@@ -73,7 +73,7 @@ class L4D2ServerManager(Star):
         configs = self._parse_server_configs()
         self.process_manager.servers = {c.name: c for c in configs}
 
-    def _get_rcon_client(self, server_name: str) -> Optional[RconClient]:
+    def _get_rcon_client(self, server_name: str) -> RconClient | None:
         """Create an RCON client for the given server.
 
         Args:
@@ -85,15 +85,28 @@ class L4D2ServerManager(Star):
         config = self.process_manager.get_server(server_name)
         if config is None:
             return None
+        connect = None
+        if config.ssh_enabled and config.rcon_via_ssh:
+            # The RCON port is often not reachable from the machine running
+            # AstrBot, so a server managed over SSH is reached through a tunnel
+            # on that same SSH connection. The game server runs on the SSH host
+            # itself, whose loopback address is tried because a host firewall
+            # often blocks its own public address.
+            ssh = self.process_manager.get_ssh_client(server_name)
+            if ssh is not None:
+                connect = partial(
+                    ssh.open_rcon_tunnel,
+                    config.rcon_port,
+                    host=config.rcon_tunnel_host,
+                )
         return RconClient(
             host=config.host,
             port=config.rcon_port,
             password=config.rcon_password,
+            connect=connect,
         )
 
-    def _resolve_server(
-        self, server_name: str
-    ) -> tuple[Optional[str], Optional[str]]:
+    def _resolve_server(self, server_name: str) -> tuple[str | None, str | None]:
         """Resolve a server name, defaulting to the first configured server.
 
         Args:
@@ -129,7 +142,7 @@ class L4D2ServerManager(Star):
         admins = [str(a) for a in self.config.get("admins", [])]
         return sender_id in admins
 
-    def _check_admin(self, event: AstrMessageEvent) -> Optional[str]:
+    def _check_admin(self, event: AstrMessageEvent) -> str | None:
         """Verify admin permission for high-risk operations.
 
         Args:
@@ -142,7 +155,7 @@ class L4D2ServerManager(Star):
             return "权限不足：仅管理员可执行此操作。"
         return None
 
-    def _check_query_permission(self, event: AstrMessageEvent) -> Optional[str]:
+    def _check_query_permission(self, event: AstrMessageEvent) -> str | None:
         """Verify permission for query operations.
 
         Query commands are available to everyone if allow_public_query is True,
@@ -178,7 +191,7 @@ class L4D2ServerManager(Star):
         """
         await self.put_kv_data(KV_PRESETS_KEY, presets)
 
-    async def _get_preset(self, name: str) -> Optional[dict]:
+    async def _get_preset(self, name: str) -> dict | None:
         """Get a single saved preset by name.
 
         Args:
@@ -192,7 +205,7 @@ class L4D2ServerManager(Star):
 
     def _resolve_preset_server(
         self, preset: dict, user_server: str
-    ) -> tuple[Optional[str], Optional[str]]:
+    ) -> tuple[str | None, str | None]:
         """Resolve which server a preset should operate on.
 
         Priority: user-specified server > preset's server > default server.
@@ -217,15 +230,25 @@ class L4D2ServerManager(Star):
         return candidate, None
 
     async def initialize(self) -> None:
-        """Plugin initialization hook. Logs loaded server count."""
+        """Plugin initialization hook.
+
+        Reloads the server configuration and re-detects remote server states.
+        """
         self._refresh_process_manager()
         count = len(self.process_manager.get_all_server_names())
-        logger.info("L4D2ServerManager initialized with %d configured server(s).", count)
+        logger.info(
+            "L4D2ServerManager initialized with %d configured server(s).", count
+        )
+        await self.process_manager.refresh_ssh_states()
 
     async def terminate(self) -> None:
-        """Plugin termination hook. Stops all managed server processes."""
-        logger.info("L4D2ServerManager terminating, stopping all server processes...")
-        await self.process_manager.terminate_all()
+        """Plugin termination hook.
+
+        Intentionally leaves the servers running: AstrBot reloads a plugin
+        whenever its configuration is saved, so stopping the servers here would
+        shut them down on every config change. Use /l4d2 stop instead.
+        """
+        logger.info("L4D2ServerManager unloading; running servers are left untouched.")
 
     # --- Command group definition ---
 
@@ -266,7 +289,9 @@ class L4D2ServerManager(Star):
         if self.process_manager.is_running(name):
             rcon = self._get_rcon_client(name)
             if rcon is None:
-                yield event.plain_result(f"服务器 '{name}' 配置缺失，无法创建 RCON 客户端。")
+                yield event.plain_result(
+                    f"服务器 '{name}' 配置缺失，无法创建 RCON 客户端。"
+                )
                 return
             try:
                 raw = await rcon.status()
@@ -278,7 +303,9 @@ class L4D2ServerManager(Star):
                     f"服务器可能尚未完全启动，请稍后重试。"
                 )
         else:
-            yield event.plain_result(f"服务器 '{name}' 当前未运行。使用 /l4d2 start {name} 启动。")
+            yield event.plain_result(
+                f"服务器 '{name}' 当前未运行。使用 /l4d2 start {name} 启动。"
+            )
 
     @l4d2.command("players")
     async def cmd_players(self, event: AstrMessageEvent, server_name: str = ""):
@@ -440,7 +467,11 @@ class L4D2ServerManager(Star):
             server = pdata.get("server", "") or "默认"
             params = pdata.get("params", "")
             created_at = pdata.get("created_at", 0)
-            time_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(created_at)) if created_at else "未知"
+            time_str = (
+                time.strftime("%Y-%m-%d %H:%M", time.localtime(created_at))
+                if created_at
+                else "未知"
+            )
             lines.append(
                 f"{idx}. {pname}\n"
                 f"   服务器: {server} | 保存于: {time_str}\n"
@@ -480,8 +511,7 @@ class L4D2ServerManager(Star):
         preset = await self._get_preset(safe_name)
         if preset is None:
             yield event.plain_result(
-                f"预设 '{safe_name}' 不存在。\n"
-                f"使用 /l4d2 saves 查看所有预设。"
+                f"预设 '{safe_name}' 不存在。\n使用 /l4d2 saves 查看所有预设。"
             )
             return
 
@@ -663,30 +693,36 @@ class L4D2ServerManager(Star):
             "  /l4d2 help              显示此帮助信息",
         ]
         if is_admin:
-            lines.extend([
-                "",
-                "【管理命令】（仅管理员）",
-                "  /l4d2 start [服务器名]   启动服务器",
-                "  /l4d2 stop [服务器名]    停止服务器",
-                "  /l4d2 restart [服务器名] 重启服务器",
-                "  /l4d2 say <内容>         全局广播消息",
-                "  /l4d2 kick <玩家名>      踢出玩家",
-                "  /l4d2 map <地图名>       切换地图",
-                "  /l4d2 diff <难度>        修改难度 (easy/normal/hard/expert)",
-                "",
-                "【启动预设】（仅管理员）",
-                "  /l4d2 save <名称> [服务器名] <参数...>  保存启动预设",
-                "  /l4d2 saves                               列出所有预设",
-                "  /l4d2 unsave <名称>                       删除预设",
-                "  /l4d2 run <名称> [服务器名]               使用预设启动",
-            ])
+            lines.extend(
+                [
+                    "",
+                    "【管理命令】（仅管理员）",
+                    "  /l4d2 start [服务器名]   启动服务器",
+                    "  /l4d2 stop [服务器名]    停止服务器",
+                    "  /l4d2 restart [服务器名] 重启服务器",
+                    "  /l4d2 say <内容>         全局广播消息",
+                    "  /l4d2 kick <玩家名>      踢出玩家",
+                    "  /l4d2 map <地图名>       切换地图",
+                    "  /l4d2 diff <难度>        修改难度 (easy/normal/hard/expert)",
+                    "",
+                    "【启动预设】（仅管理员）",
+                    "  /l4d2 save <名称> [服务器名] <参数...>  保存启动预设",
+                    "  /l4d2 saves                               列出所有预设",
+                    "  /l4d2 unsave <名称>                       删除预设",
+                    "  /l4d2 run <名称> [服务器名]               使用预设启动",
+                ]
+            )
         else:
-            lines.extend([
+            lines.extend(
+                [
+                    "",
+                    "（管理命令仅管理员可见，如需使用请联系管理员。）",
+                ]
+            )
+        lines.extend(
+            [
                 "",
-                "（管理命令仅管理员可见，如需使用请联系管理员。）",
-            ])
-        lines.extend([
-            "",
-            "提示：不指定服务器名时默认操作第一台服务器。",
-        ])
+                "提示：不指定服务器名时默认操作第一台服务器。",
+            ]
+        )
         yield event.plain_result("\n".join(lines))

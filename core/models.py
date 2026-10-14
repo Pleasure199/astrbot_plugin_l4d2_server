@@ -5,6 +5,45 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
+def _to_int(value, default: int) -> int:
+    """Convert a raw configuration value to int.
+
+    Args:
+        value: Raw value from the plugin configuration, which may be an empty
+            string or ``None`` when a template entry was left blank.
+        default: Value returned when the input cannot be converted.
+
+    Returns:
+        The converted integer, or ``default``.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_bool(value, default: bool) -> bool:
+    """Convert a raw configuration value to bool.
+
+    Args:
+        value: Raw value from the plugin configuration. Hand-written JSON may
+            store booleans as strings, where ``bool("false")`` would be wrong.
+        default: Value returned when the input is not recognised.
+
+    Returns:
+        The converted boolean, or ``default``.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "yes", "1", "on"}:
+            return True
+        if lowered in {"false", "no", "0", "off", ""}:
+            return False
+    return default
+
+
 @dataclass
 class ServerConfig:
     """Configuration for a single L4D2 dedicated server.
@@ -25,6 +64,9 @@ class ServerConfig:
         ssh_username: SSH login username.
         ssh_password: SSH login password (or passphrase for key).
         ssh_key_path: Path to SSH private key file (alternative to password).
+        rcon_via_ssh: Whether RCON traffic is tunnelled through the SSH session.
+        rcon_tunnel_host: Tunnel destination as seen from the SSH host; empty
+            means the SSH host itself (127.0.0.1).
     """
 
     name: str
@@ -42,9 +84,11 @@ class ServerConfig:
     ssh_username: str = ""
     ssh_password: str = ""
     ssh_key_path: str = ""
+    rcon_via_ssh: bool = True
+    rcon_tunnel_host: str = ""
 
     @classmethod
-    def from_dict(cls, data: dict) -> "ServerConfig":
+    def from_dict(cls, data: dict) -> ServerConfig:
         """Create a ServerConfig from a raw dictionary, ignoring unknown keys.
 
         Args:
@@ -54,21 +98,23 @@ class ServerConfig:
             A populated ServerConfig instance.
         """
         return cls(
-            name=str(data.get("name", "")),
-            host=str(data.get("host", "127.0.0.1")),
-            port=int(data.get("port", 27015)),
-            rcon_port=int(data.get("rcon_port", 27015)),
+            name=str(data.get("name", "")).strip(),
+            host=str(data.get("host", "127.0.0.1")).strip() or "127.0.0.1",
+            port=_to_int(data.get("port"), 27015),
+            rcon_port=_to_int(data.get("rcon_port"), 27015),
             rcon_password=str(data.get("rcon_password", "")),
-            srcds_path=str(data.get("srcds_path", "")),
+            srcds_path=str(data.get("srcds_path", "")).strip(),
             start_params=str(data.get("start_params", "")),
-            max_players=int(data.get("max_players", 8)),
-            default_map=str(data.get("default_map", "c2m1_highway")),
-            ssh_enabled=bool(data.get("ssh_enabled", False)),
-            ssh_host=str(data.get("ssh_host", "")),
-            ssh_port=int(data.get("ssh_port", 22)),
-            ssh_username=str(data.get("ssh_username", "")),
+            max_players=_to_int(data.get("max_players"), 8),
+            default_map=str(data.get("default_map", "")).strip() or "c2m1_highway",
+            ssh_enabled=_to_bool(data.get("ssh_enabled"), False),
+            ssh_host=str(data.get("ssh_host", "")).strip(),
+            ssh_port=_to_int(data.get("ssh_port"), 22),
+            ssh_username=str(data.get("ssh_username", "")).strip(),
             ssh_password=str(data.get("ssh_password", "")),
-            ssh_key_path=str(data.get("ssh_key_path", "")),
+            ssh_key_path=str(data.get("ssh_key_path", "")).strip(),
+            rcon_via_ssh=_to_bool(data.get("rcon_via_ssh"), True),
+            rcon_tunnel_host=str(data.get("rcon_tunnel_host", "")).strip(),
         )
 
 

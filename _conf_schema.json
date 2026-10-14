@@ -96,6 +96,18 @@
             "description": "SSH 私钥路径",
             "hint": "可选，使用密钥认证时填写私钥文件的本地路径",
             "default": ""
+          },
+          "rcon_via_ssh": {
+            "type": "bool",
+            "description": "RCON 经 SSH 通道连接",
+            "hint": "默认开启：RCON 指令会通过 SSH 通道转发到远程主机的 127.0.0.1:rcon_port，无需对外暴露 RCON 端口；只有在 AstrBot 能直连 RCON 端口、或远程主机禁止 SSH 端口转发时才需要关闭",
+            "default": true
+          },
+          "rcon_tunnel_host": {
+            "type": "string",
+            "description": "RCON 隧道目标地址",
+            "hint": "留空表示远程主机本机（127.0.0.1）；服务端运行在 Docker 等容器里时可填容器 IP（如 172.17.0.2），端口仍取 rcon_port",
+            "default": ""
           }
         }
       }
