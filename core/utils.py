@@ -77,10 +77,13 @@ def parse_status_output(raw: str) -> ServerStatus:
             status.max_players = int(match.group(2))
             continue
 
-        # player line: "# userid name uniqueid connected ping loss state rate adr"
-        # Actual player lines start with '#' followed by a numeric userid
-        match = re.match(
-            r"#\s*(\d+)\s+\"(.+?)\"\s+(\[.*?\]|\S+)\s+\S+\s+(\d+)\s+(\d+)\s+(\S+)\s+(\d+)\s+(\S+)",
+        # L4D2 inserts a numeric slot between userid and the quoted name.
+        # Some status variants omit rate/address. BOT rows have no connection
+        # metrics and are excluded to match the human count in the summary.
+        match = re.fullmatch(
+            r'#\s*(\d+)\s+(?:\d+\s+)?"(.*)"\s+'
+            r"(\[.*?\]|\S+)\s+\S+\s+(\d+)\s+(\d+)\s+(\S+)"
+            r"(?:\s+(\d+))?(?:\s+(\S+))?\s*",
             stripped,
         )
         if match:
@@ -91,8 +94,8 @@ def parse_status_output(raw: str) -> ServerStatus:
                 ping=match.group(4),
                 loss=match.group(5),
                 state=match.group(6),
-                rate=match.group(7),
-                address=match.group(8),
+                rate=match.group(7) or "",
+                address=match.group(8) or "",
             )
             status.players.append(player)
             continue

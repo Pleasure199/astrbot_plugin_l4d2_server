@@ -332,15 +332,18 @@ class L4D2ServerManager(Star):
         try:
             raw = await rcon.status()
             status = parse_status_output(raw)
-            if not status.players:
+            if status.player_count <= 0:
                 yield event.plain_result(f"服务器 '{name}' 当前无玩家在线。")
             else:
-                lines = [f"=== {name} 在线玩家 ({len(status.players)}人) ==="]
-                for p in status.players:
-                    lines.append(
-                        f"  [{p.userid}] {p.name}\n"
-                        f"    延迟: {p.ping}ms | 丢包: {p.loss}% | 状态: {p.state}"
-                    )
+                lines = [f"=== {name} 在线玩家 ({status.player_count}人) ==="]
+                if status.players:
+                    for p in status.players:
+                        lines.append(
+                            f"  [{p.userid}] {p.name}\n"
+                            f"    延迟: {p.ping}ms | 丢包: {p.loss}% | 状态: {p.state}"
+                        )
+                else:
+                    lines.append("人数已获取，但暂无法解析玩家明细。")
                 yield event.plain_result("\n".join(lines))
         except RconError as e:
             yield event.plain_result(f"RCON 连接失败：{e}")

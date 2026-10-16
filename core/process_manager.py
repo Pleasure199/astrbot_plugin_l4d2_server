@@ -235,26 +235,45 @@ class ProcessManager:
             self._ssh_running.add(server_name)
             return False, f"服务器 '{server_name}' 已经在运行中。"
 
-        # Check remotely whether start.sh exists in the resolved directory
+        # Check remotely whether start.sh exists in the resolved directory.
+        # ``server_dir`` may legitimately contain spaces or quotes, so it must
+        # remain one shell argument.
         _, out, _ = await ssh.execute(
-            f'test -f "{server_dir}/start.sh" && echo 1 || echo 0'
+            f"test -f {shlex.quote(f'{server_dir}/start.sh')} && echo 1 || echo 0"
         )
         has_start_sh = out.strip() == "1"
 
         if has_start_sh:
-            start_cmd = "bash start.sh"
+            start_args = ["bash", "start.sh"]
             launch_mode = "启动脚本: start.sh (SSH远程)"
         else:
-            start_cmd = (
-                f"./srcds_run -game left4dead2 -port {config.port} "
-                f"+hostport {config.port} -maxplayers {config.max_players} "
-                f"+map {config.default_map} +exec server.cfg -console"
-            )
+            start_args = [
+                "./srcds_run",
+                "-game",
+                "left4dead2",
+                "-port",
+                str(config.port),
+                "+hostport",
+                str(config.port),
+                "-maxplayers",
+                str(config.max_players),
+                "+map",
+                config.default_map,
+                "+exec",
+                "server.cfg",
+                "-console",
+            ]
             launch_mode = "srcds 直接启动 (SSH远程)"
 
-        # Append user-defined start parameters
+        # Parse additional parameters into arguments before quoting every item.
+        # Admins may save presets from chat, so interpolating this text into the
+        # remote shell command would grant them arbitrary shell execution.
         if config.start_params:
-            start_cmd = f"{start_cmd} {config.start_params}"
+            try:
+                start_args.extend(shlex.split(config.start_params))
+            except ValueError as e:
+                return False, f"启动参数格式错误: {e}"
+        start_cmd = " ".join(shlex.quote(arg) for arg in start_args)
 
         ok, msg = await ssh.start_server(server_dir, start_cmd)
         if not ok:
@@ -306,8 +325,11 @@ class ProcessManager:
 
         processes = await ssh.list_srcds_processes()
         matched = self._match_ssh_processes(server_dir, config.port, processes)
-        if not matched and (pgid is None or not await ssh.pid_alive(pgid)):
+        if not matched:
             self._ssh_running.discard(server_name)
+            # A pid file outlives a crash and PIDs can be reused. Never kill a
+            # process group based on that file without a current srcds match.
+            await ssh.remove_pid_file(server_dir)
             if processes:
                 listing = "\n".join(
                     f"  PID {p['pid']} cwd={p['cwd']} args={p['args'][:80]}"
@@ -337,11 +359,21 @@ class ProcessManager:
                 server_name,
             )
 
-        # --- Kill the recorded process group, then any leftover srcds process ---
-        if pgid is not None:
+        # --- Kill the verified process group, then any leftover srcds process ---
+        # A recorded PGID is trusted only when an identified srcds process still
+        # belongs to it. This prevents a stale pid file from targeting an
+        # unrelated process group after PID reuse.
+        matched_pgids = {
+            int(process["pgid"])
+            for process in matched
+            if process["pgid"].isdigit()
+        }
+        if pgid is not None and pgid in matched_pgids:
             await ssh.kill_targets(pgid, [])
 
-        leftovers = self._match_ssh_processes(server_dir, config.port, processes)
+        leftovers = self._match_ssh_processes(
+            server_dir, config.port, await ssh.list_srcds_processes()
+        )
         if leftovers:
             await ssh.kill_targets(None, [p["pid"] for p in leftovers])
             leftovers = self._match_ssh_processes(
@@ -391,15 +423,19 @@ class ProcessManager:
             server_dir: Resolved server directory on the remote host.
 
         Returns:
-            True if the recorded process group is alive or a srcds process of
-            this server is still running.
+            True if a matching srcds process is running. When a process group
+            is recorded, the match must belong to that group.
         """
         ssh = self._get_ssh_client(config)
         _server_dir, pgid = await ssh.read_server_state(server_dir)
-        if pgid is not None and await ssh.pid_alive(pgid):
-            return True
         processes = await ssh.list_srcds_processes()
-        return bool(self._match_ssh_processes(server_dir, config.port, processes))
+        matched = self._match_ssh_processes(server_dir, config.port, processes)
+        if pgid is None:
+            return bool(matched)
+        return any(
+            process["pgid"].isdigit() and int(process["pgid"]) == pgid
+            for process in matched
+        )
 
     def get_running_servers(self) -> set[str]:
         """Return the set of server names that currently have a running process.
@@ -857,12 +893,14 @@ class ProcessManager:
         """
         ssh = self._get_ssh_client(config)
         server_dir, pgid = await ssh.read_server_state(config.srcds_path)
-        if pgid is not None:
-            running = await ssh.pid_alive(pgid)
+        processes = await ssh.list_srcds_processes()
+        matched = self._match_ssh_processes(server_dir, config.port, processes)
+        if pgid is None:
+            running = bool(matched)
         else:
-            processes = await ssh.list_srcds_processes()
-            running = bool(
-                self._match_ssh_processes(server_dir, config.port, processes)
+            running = any(
+                process["pgid"].isdigit() and int(process["pgid"]) == pgid
+                for process in matched
             )
         if running:
             self._ssh_running.add(server_name)
